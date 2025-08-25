@@ -75,3 +75,4 @@ while True:
         device_id = devices[ChoosedNum].get("id")
         battery_level = get_bluetooth_battery_windows(device_id)
         print (battery_level)
+        exit()
