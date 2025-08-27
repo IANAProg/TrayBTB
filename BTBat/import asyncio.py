@@ -1,5 +1,65 @@
 import subprocess
 import re
+import sys
+import pystray
+from pystray import MenuItem as item
+from PIL import Image, ImageDraw
+import threading
+import time
+
+exitTrap = False
+icon = None
+
+def create_image(color='blue'):
+    """Создаем иконку с разными цветами"""
+    image = Image.new('RGB', (64, 64), 'white')
+    dc = ImageDraw.Draw(image)
+    dc.rectangle((16, 16, 48, 48), fill=color)
+    return image
+
+def update_icon(new_color):
+    """Обновляем иконку"""
+    new_image = create_image(new_color)
+    icon.icon = new_image
+    icon.update_menu()  # Обновляем меню
+
+def update_tooltip(new_tooltip):
+    """Обновляем всплывающую подсказку"""
+    icon.title = new_tooltip
+    icon.update_menu()
+
+def change_name(new_name):
+    """Меняем название приложения"""
+    icon.name = new_name
+    icon.update_menu()
+
+# Функции для меню
+
+def show_settings():
+    pass
+
+def exit_app():
+    global exitTrap
+    exitTrap = True
+    icon.stop()
+
+    
+
+# Создаем меню
+menu = (
+    item('Девайсы', show_settings),
+    item('Выход', exit_app)
+)
+
+# Создаем иконку в трее
+icon = pystray.Icon("TrayBTB", create_image(), "TrayBTB --Updating devices--", menu)
+
+# Запускаем иконку в отдельном потоке
+def run_tray():
+    icon.run()
+
+tray_thread = threading.Thread(target=run_tray, daemon=True)
+tray_thread.start()
 
 def get_battery_via_powershell(device_id):
 
@@ -26,8 +86,9 @@ def get_bluetooth_devices_windows():
         # Используем PowerShell для получения Bluetooth устройств
         result = subprocess.run(
             ["powershell", "-Command", 
-             "Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK'} | "
-             "Select-Object FriendlyName, InstanceId | Format-List"],
+            "Get-PnpDevice -Class Bluetooth | Where-Object Status -eq 'OK' | ForEach-Object {$batteryLevel = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data "
+            "\nif ($null -ne $batteryLevel) {$_ | Select-Object FriendlyName, InstanceId, @{Name='BatteryLevel';Expression={$batteryLevel}}}}| Format-List"
+            ],
             capture_output=True, text=True, check=True, encoding='cp866'
         )
         
@@ -49,9 +110,10 @@ def get_bluetooth_devices_windows():
         
     except Exception as e:
         print(f"Ошибка: {e}")
+        print(f'\nПодробности: {e.stderr}')
         return []
 
-def get_bluetooth_battery_windows( device_id):
+def get_bluetooth_battery_windows(device_id):
     battery_level = get_battery_via_powershell(device_id)
     if battery_level is not None:
         return battery_level
@@ -75,4 +137,9 @@ while True:
         device_id = devices[ChoosedNum].get("id")
         battery_level = get_bluetooth_battery_windows(device_id)
         print (battery_level)
-        exit()
+        break
+
+update_tooltip("TrayBTB --Choose device--")
+update_icon("black")
+while exitTrap!=True:
+    pass
