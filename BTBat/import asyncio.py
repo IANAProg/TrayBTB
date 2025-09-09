@@ -1,220 +1,373 @@
+import asyncio
+import logging
 import subprocess
 import re
 import pystray
-from pystray import MenuItem as item
-from pystray import Menu
-from PIL import Image, ImageDraw
-import threading
-import time
-from winotify import Notification as winNot, audio 
 import os
+import threading
+from pystray import MenuItem as item
+from PIL import Image, ImageDraw
+from winotify import Notification as WinNotification, audio
+from enum import Enum
+from typing import List, Dict, Optional
+from datetime import datetime
+from dataclasses import dataclass
 
-icoPath = os.path.abspath(__file__).replace("import asyncio.py","TrayBTB.png")
-devices = []
-exitTrap = False
-icon = None
-choosenDevice = ""
-choosenDeviceID = ""
-state = 1 # 0 - updating, 1 - no device choosed, 2 - device has chosen
+fulltime = str(datetime.now())
 
+@dataclass
+class BatStatus:
+    level: Optional[int]
+    last_update: float
+    error_count: int = 0
 
-def get_hex_color(val):
-    """
-    Возвращает hex-код цвета (#RRGGBB)
-    """
-    normalized = val / 100
-    normalized = max(0, min(1, normalized))
+class Logs:
+    def __init__(self):
+        self.log = logging.getLogger("TrayBTB")
+        if not os.path.exists("logs"):
+            os.makedirs("logs")
+        logFileStart = "logs\\TrayBTB_"
+        logFileExt = ".log"
+        self.logFileName = logFileStart+fulltime[:fulltime.rfind('.')].replace(" ","_").replace(":","-")+logFileExt
+        self.logLevel = logging.INFO
+        self.log.setLevel(self.logLevel)
+        self.handler = logging.FileHandler(filename=self.logFileName, mode = "a", encoding='utf-8')
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        self.handler.setFormatter(formatter)
+        self.log.addHandler(self.handler)
+        self.log.info("Logging initialized")
+
+    def changeLogLevel(self, level: int):
+        self.log.setLevel(level)
     
-    red = int(255 * (1 - normalized))
-    green = int(255 * normalized)
-    
-    return f"#{red:02x}{green:02x}00"
+class DeviceState(Enum):
+    UPDATING = 0
+    NO_DEVICE = 1
+    DEVICE_CHOSEN = 2
 
-
-
-def get_updated_menu():
-    """Получаем обновленное меню"""
-    return (
-        item('Обновить список девайсов', update_devices),
-        item('Девайсы', makeMenuDevices()),
-        item('Выход', exit_app)
-    )
-def get_connected_menu():
-    """Получаем обновленное меню"""
-    return (
-        item('Обновить список девайсов', update_devices),
-        item('Девайсы', makeMenuDevices()),
-        item('Отключиться от устройства', disconnect),
-        item('Выход', exit_app)
-    )
-
-def create_image(color='blue'):
-    """Создаем иконку с разными цветами"""
-    image = Image.new('RGB', (64, 64), 'white')
-    dc = ImageDraw.Draw(image)
-    dc.rectangle((16, 16, 48, 48), fill=color)
-    return image
-
-def update_icon(new_color):
-    """Обновляем иконку"""
-    new_image = create_image(new_color)
-    icon.icon = new_image
-    icon.update_menu()  # Обновляем меню
-
-def update_tooltip(new_tooltip):
-    """Обновляем всплывающую подсказку"""
-    icon.title = new_tooltip
-    icon.update_menu()
-
-def change_name(new_name):
-    """Меняем название приложения"""
-    icon.name = new_name
-    icon.update_menu()
-
-def winNotification(msg):
-    notification = winNot(app_id="TrayBTB", title="TrayBTB", msg=msg, icon=icoPath)
-    notification.set_audio(audio.Default,False)
-    notification.show()
-# Функции для меню
-def chooseDevice(name,id):
-    def handler(icon,item):
-        global choosenDevice, choosenDeviceID, state
-        choosenDevice = name
-        choosenDeviceID = id
-        state = 2
-        winNotification(f"Connected to {choosenDevice}!")
-        icon.menu = get_connected_menu()
-        icon.update_menu()
-    return handler
-
-def makeMenuDevices():
-    """Создание меню устройств"""
-    if devices and len(devices) > 0:
-        menu_items = [
-            item(device.get("name"), chooseDevice(device.get("name"),device.get("id")))
-            for device in devices
-        ]
-    else:
-        menu_items = [item("Нет устройств", lambda icon, item: None)]
-    return Menu(*menu_items)
-
-def disconnect():
-    global choosenDeviceID, choosenDevice,state
-    winNotification(f"Disconnected from {choosenDevice}. \nPlease choose device!")
-    choosenDevice = ""
-    choosenDeviceID = ""
-    icon.menu = (
-    item('Обновить список девайсов',update_devices),
-    item('Девайсы', makeMenuDevices()),
-    item('Выход', exit_app)
-    )
-    icon.update_menu()
-    state = 1
-
-def exit_app():
-    global exitTrap
-    exitTrap = True
-    icon.stop()
-
-def get_battery_via_powershell(device_id):
-
-    try:
-        # Этот метод работает для ограниченного числа устройств
-        result = subprocess.run([
-            "powershell", "-Command",
-            f"Get-PnpDeviceProperty -InstanceId '{device_id}' -KeyName 'DEVPKEY_Device_BatteryLevel'| select data"
-        ], capture_output=True, text=True, encoding='cp866')
+class BatteryMonitor:
+    def __init__(self):
+        self.device_id: str = ""
         
-        if result.returncode == 0:
-            match = re.search(r'[0-9]+', result.stdout)
-            if match:
-                return int(match.group(0))
-        
-        return None
-        
-    except Exception as e:
-        print(f"Ошибка PowerShell: {e}")
-        return None
+    def get_battery_level(self) -> Optional[int]:
+        try:
+            result = subprocess.run([
+                "powershell", "-Command",
+                f"Get-PnpDeviceProperty -InstanceId '{self.device_id}' -KeyName 'DEVPKEY_Device_BatteryLevel'| select data"
+            ], capture_output=True, text=True, encoding='cp866')
+            
+            if result.returncode == 0:
+                match = re.search(r'[0-9]+', result.stdout)
+                if match:
+                    return int(match.group(0))
+            return None
+        except Exception as e:
+            print(f"PowerShell error: {e}")
+            return None
 
-def get_bluetooth_devices_windows():
-    try:
-        # Используем PowerShell для получения Bluetooth устройств
-        result = subprocess.run(
-            ["powershell", "-Command", 
-            "Get-PnpDevice -Class Bluetooth | Where-Object Status -eq 'OK' | ForEach-Object {$batteryLevel = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data "
-            "\nif ($null -ne $batteryLevel) {$_ | Select-Object FriendlyName, InstanceId, @{Name='BatteryLevel';Expression={$batteryLevel}}}}| Format-List"
-            ],
-            capture_output=True, text=True, check=True, encoding='cp866'
+class DeviceManager:
+    def get_devices(self) -> List[Dict[str, str]]:
+        try:
+            result = subprocess.run(
+                ["powershell", "-Command", 
+                "Get-PnpDevice -Class Bluetooth | Where-Object Status -eq 'OK' | ForEach-Object {$batteryLevel = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data "
+                "\nif ($null -ne $batteryLevel) {$_ | Select-Object FriendlyName, InstanceId, @{Name='BatteryLevel';Expression={$batteryLevel}}}}| Format-List"
+                ],
+                capture_output=True, text=True, check=True, encoding='cp866'
+            )
+            
+            devices = []
+            lines = result.stdout.split('\n')
+            current_device = {}
+        
+            for line in lines:
+                line = line.strip()
+                if line.startswith('FriendlyName'):
+                    if current_device:
+                        devices.append(current_device)
+                    current_device = {'name': line.split(':', 1)[1].strip()}
+                elif line.startswith('InstanceId'):
+                    current_device['id'] = line.split(':', 1)[1].strip()
+            if current_device:
+                devices.append(current_device)
+            return devices
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            return []
+
+class IconManager:
+    def __init__(self, size: tuple = (64, 64)):
+        self.size = size
+        
+    def create_image(self, color: str = 'blue') -> Image:
+        image = Image.new('RGB', self.size, 'white')
+        dc = ImageDraw.Draw(image)
+        dc.rectangle((16, 16, 48, 48), fill=color)
+        return image    
+    @staticmethod
+    def get_hex_color(val: float) -> str:
+        normalized = max(0, min(1, val / 100))
+        red = int(255 * (1 - normalized))
+        green = int(255 * normalized)
+        return f"#{red:02x}{green:02x}00"
+
+class NotificationManager:
+    def __init__(self, app_name: str, icon_path: str):
+        self.app_name = app_name
+        self.icon_path = icon_path
+        
+    def show_notification(self, message: str):
+        notification = WinNotification(
+            app_id=self.app_name,
+            title=self.app_name,
+            msg=message,
+            icon=self.icon_path
+        )
+        notification.set_audio(audio.Reminder, False)
+        notification.show()
+
+class TrayApplication:
+    def __init__(self):
+        self.state = DeviceState.NO_DEVICE
+        self.exit_flag = False
+        self.chosen_device = ""
+        self.chosen_device_id = ""
+        self.devices = []
+        
+        self.icon_manager = IconManager()
+        self.battery_monitor = BatteryMonitor()
+        self.device_manager = DeviceManager()
+        self.notification_manager = NotificationManager(
+            "TrayBTB",
+            os.path.join(os.path.dirname(__file__), "TrayBTB.png")
+        )
+        self.update_interval = 1.0
+        self.error_threshold = 10
+        self.log_handler = Logs()
+        self.battery_status = BatStatus(level=None,last_update=0)
+
+        self.icon = None
+        self.setup_tray()
+
+    def setup_tray(self):
+        menu = (
+            item('Обновить список девайсов', self.update_devices),
+            item('Девайсы', self.make_menu_devices()),
+            item('Выход', self.exit_app)
+        )
+        self.icon = pystray.Icon(
+            "TrayBTB",
+            self.icon_manager.create_image(),
+            "TrayBTB --Updating devices--",
+            menu
+        )
+
+    def run(self):
+        tray_thread = threading.Thread(target=self.icon.run, daemon=True)
+        tray_thread.start()
+
+        self.log_handler.log.info("App started")
+        self.notification_manager.show_notification(
+            "App started. \nPlease, update your device list and choose device!"
         )
         
-        devices = []
-        lines = result.stdout.split('\n')
-        current_device = {}
+        asyncio.run(self.main_loop())
+
+    async def main_loop(self):
+        try:
+            while not self.exit_flag:
+                await self.handle_state()
+                await asyncio.sleep(self.update_interval)
+                
+        except Exception as e:
+            self.log_handler.log.error(f"Main loop error: {e}")
+            self.notification_manager.show_notification(
+                "Error in main loop. Application will restart."
+            )
+            self.exit_app()
+
+    async def handle_state(self):
+        """Handle different application states and update UI accordingly."""
+        try:
+            match self.state:
+                case DeviceState.UPDATING:
+                    await self.handle_updating_state()
+                case DeviceState.NO_DEVICE:
+                    await self.handle_no_device_state()
+                case DeviceState.DEVICE_CHOSEN:
+                    await self.handle_device_chosen_state()
+                case _:
+                    self.log_handler.log.warning(f"Unknown state: {self.state}")
+                    
+        except Exception as e:
+            self.log_handler.log.error(f"State handling error: {e}")
+            self.battery_status.error_count += 1
+            
+            if self.battery_status.error_count >= self.error_threshold:
+                self.notification_manager.show_notification(
+                    "Multiple errors occurred. Please check device connection."
+                )
+                await self.auto_disconnect()
+
+    async def handle_updating_state(self):
+        """Handle the updating state UI."""
+        self.update_icon("blue")
+        self.update_tooltip("TrayBTB --Updating devices--")
+
+    async def handle_no_device_state(self):
+        """Handle the no device state UI."""
+        self.update_tooltip("TrayBTB --Choose device--")
+        self.update_icon("black")
+
+    async def handle_device_chosen_state(self):
+        """Handle the device chosen state, including battery monitoring."""
+        bat_level = self.battery_monitor.get_battery_level()
         
-        for line in lines:
-            line = line.strip()
-            if line.startswith('FriendlyName'):
-                if current_device:
-                    devices.append(current_device)
-                current_device = {'name': line.split(':', 1)[1].strip()}
-            elif line.startswith('InstanceId'):
-                current_device['id'] = line.split(':', 1)[1].strip()
-        if current_device:
-            devices.append(current_device)
-        return devices
+        if bat_level is not None:
+            self.battery_status.level = bat_level
+            self.battery_status.error_count = 0
+            self.update_tooltip(f"TrayBTB --{bat_level}%--")
+            self.update_icon(self.icon_manager.get_hex_color(bat_level))
+            
+            # Alert on low battery
+            if bat_level <= 20:
+                self.notification_manager.show_notification(
+                    f"Низкий заряд батареи: {bat_level}%"
+                )
+        else:
+            self.battery_status.error_count += 1
+            self.log_handler.log.warning("Failed to get battery level")
+
+    async def auto_disconnect(self):
+        """Automatically disconnect device after too many errors."""
+        self.log_handler.log.info("Auto-disconnecting due to errors")
+        self.disconnect_device(None)
+        self.battery_status.error_count = 0
+
+    def update_icon(self, new_color: str):
+        self.icon.icon = self.icon_manager.create_image(new_color)
+        self.icon.update_menu()
+
+    def update_tooltip(self, new_tooltip: str):
+        self.icon.title = new_tooltip
+        self.icon.update_menu()
+
+    def update_devices(self):
+        self.log_handler.log.info("State: Updating devices")
+        self.state = DeviceState.UPDATING
+        self.devices = self.device_manager.get_devices()
+        self.log_handler.log.info("Ended seeking for devices")
+        self.notification_manager.show_notification("Choose device!")
+        self.state = (DeviceState.DEVICE_CHOSEN 
+                     if self.chosen_device 
+                     else DeviceState.NO_DEVICE)
+        self.icon_manager.create_image("Black" if self.state == DeviceState.NO_DEVICE else self.icon_manager.get_hex_color({self.battery_monitor.get_battery_level}))
+        self.icon.menu = self.get_updated_menu()
+        self.icon.update_menu()
+
+    def make_menu_devices(self) -> pystray.Menu:
+        """
+        Creates a menu of available Bluetooth devices.
         
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        print(f'\nПодробности: {e.stderr}')
-        return []
+        Returns:
+            pystray.Menu: Menu containing device options
+        """
+        if self.devices and len(self.devices) > 0:
+            menu_items = [
+                item(
+                    device.get("name"), 
+                    self.choose_device(device.get("name"), device.get("id"))
+                )
+                for device in self.devices
+            ]
+        else:
+            menu_items = [item("No devices", lambda icon, item: None)]
+            
+        return pystray.Menu(*menu_items)
 
-def get_bluetooth_battery_windows(device_id):
-    battery_level = get_battery_via_powershell(device_id)
-    if battery_level is not None:
-        return battery_level
+    def choose_device(self, name: str, device_id: str):
+        """
+        Creates a handler function for device selection.
+        
+        Args:
+            name: Device friendly name
+            device_id: Device instance ID
+        
+        Returns:
+            Callable: Handler function for menu item
+        """
+        def handler(icon: pystray.Icon, item: item):
+            self.chosen_device = name
+            self.chosen_device_id = device_id
+            self.battery_monitor.device_id = device_id
+            self.state = DeviceState.DEVICE_CHOSEN
+            
+            self.log_handler.log.info(f"State: Device chosen. It's {self.chosen_device}")
+            self.notification_manager.show_notification(
+                f"Connected to {self.chosen_device}!"
+            )
+            
+            # Update menu to include disconnect option
+            self.icon.menu = self.get_connected_menu()
+            self.icon.update_menu()
+            
+        return handler
 
-def update_devices():
-    global state
-    global choosenDevice
-    global devices
-    state = 0;    
-    devices = get_bluetooth_devices_windows()
-    winNotification("Choose device!")
-    if choosenDevice != "":
-        state = 2
-    else:
-        state = 1
-    icon.menu = get_updated_menu()
-    icon.update_menu()
-# Создаем меню
-menu = (
-    item('Обновить список девайсов',update_devices),
-    item('Девайсы', makeMenuDevices()),
-    item('Выход', exit_app)
+    def get_connected_menu(self) -> pystray.Menu:
+        """
+        Creates menu for when device is connected.
+        
+        Returns:
+            pystray.Menu: Updated menu with disconnect option
+        """
+        return pystray.Menu(
+            item('Update Devices', self.update_devices),
+            item('Devices', self.make_menu_devices()),
+            item('Disconnect Device', self.disconnect_device),
+            item('Exit', self.exit_app)
+        )
 
-)
+    def disconnect_device(self, item: item):
+        """Handles disconnecting from current device"""
+        self.log_handler.log.info(f"disconnect from {self.chosen_device}")
+        self.notification_manager.show_notification(
+            f"Disconnected from {self.chosen_device}. \nPlease choose device!"
+        )
+        self.chosen_device = ""
+        self.chosen_device_id = ""
+        self.battery_monitor.device_id = ""
+        self.state = DeviceState.NO_DEVICE
+        self.icon_manager.create_image("Black")
+        # Reset menu to original state
+        self.icon.menu = self.get_updated_menu()
+        self.icon.update_menu()
+    
+    def exit_app(self):
+        self.exit_flag = True
+        self.log_handler.log.info("Exiting")
+        self.icon.stop()
 
-# Создаем иконку в трее
-icon = pystray.Icon("TrayBTB", create_image(), "TrayBTB --Updating devices--", menu)
+    def get_updated_menu(self):
+        return (
+            item('Обновить список девайсов', self.update_devices),
+            item('Девайсы', self.make_menu_devices()),
+            item('Выход', self.exit_app)
+        )
+    def get_connected_menu(self):
+        return (
+            item('Обновить список девайсов', self.update_devices),
+            item('Девайсы', self.make_menu_devices()),
+            item('Отключиться от устройства', self.disconnect_device),
+            item('Выход', self.exit_app)
+        )
+        
 
-# Запускаем иконку в отдельном потоке
-def run_tray():
-    icon.run()
+def main():
+    app = TrayApplication()
+    app.run()
 
-tray_thread = threading.Thread(target=run_tray, daemon=True)
-tray_thread.start()
-
-state = 1
-winNotification("App started. \nPlease, update your device list and choose device!")
-while exitTrap!=True:
-    if state == 0:
-        update_icon("blue")
-        update_tooltip("TrayBTB --Updating devices--")
-    if state == 1:
-        update_tooltip("TrayBTB --Choose device--")
-        update_icon("black")
-    if state == 2:
-        bat = get_bluetooth_battery_windows(choosenDeviceID)
-        update_tooltip(f"TrayBTB --{bat}--")
-        update_icon(get_hex_color(bat))
-    time.sleep(1)
+if __name__ == "__main__":
+    main()
