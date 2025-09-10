@@ -9,6 +9,8 @@ import sys
 import shutil
 import win32com.client
 import concurrent.futures
+import time
+import pythoncom
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
 from winotify import Notification as WinNotification, audio
@@ -17,6 +19,9 @@ from typing import List, Dict, Optional
 from datetime import datetime
 from dataclasses import dataclass
 
+NO_WINDOW = 0
+if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW
 
 fulltime = str(datetime.now())
 if sys.platform == "win32":
@@ -64,10 +69,13 @@ class BatteryMonitor:
         
     def _read_pnp_battery(self, instance_id: str) -> Optional[int]:
         try:
-            result = subprocess.run([
-                "powershell", "-Command",
-                f"(Get-PnpDeviceProperty -InstanceId '{instance_id}' -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data"
-            ], capture_output=True, text=True, encoding='cp866')
+            result = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    f"(Get-PnpDeviceProperty -InstanceId '{instance_id}' -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data"
+                ],
+                capture_output=True, text=True, encoding='cp866', creationflags=NO_WINDOW
+            )
             if result.returncode == 0 and result.stdout:
                 match = re.search(r'[0-9]+', result.stdout)
                 if match:
@@ -82,7 +90,7 @@ class BatteryMonitor:
         if not self.device_id or not self.device_type:
             return None
         if self.device_type == "ble":
-            log_handler.log.error("somewhere got ble device, check it")
+            log_handler.log.error(f"somewhere got ble device, check it {self.device_id} {self.device_type}")
         else:
             return self._read_pnp_battery(self.device_id)
 
@@ -101,99 +109,131 @@ class DeviceManager:
         Возвращает список dict: {name, id, id_type='pnp', battery}
         """
         devices: List[Dict[str, str]] = []
+        initialized_com = False
 
+        # Инициализируем COM в текущем потоке (безопасно — логируем любые ошибки)
         try:
-            # подключаемся к WMI и получаем PNPDeviceID + Name только для кандидатов
-            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
-            svc = locator.ConnectServer(".", "root\\cimv2")
-            # фильтр по имени уменьшает количество проверяемых устройств
-            q = (
-                "SELECT PNPDeviceID, Name FROM Win32_PnPEntity "
-                "WHERE Status='OK' AND ("
-                "Name LIKE '%Headphone%' OR Name LIKE '%Headphones%' OR "
-                "Name LIKE '%Audio%' OR Name LIKE '%Hands-Free%' OR "
-                "Name LIKE '%AirPods%' OR Name LIKE '%WH%' OR Name LIKE '%BT%'"
-                ")"
-            )
-            items = svc.ExecQuery(q)
-            candidates = []
-            for it in items:
-                inst = getattr(it, "PNPDeviceID", None)
-                name = getattr(it, "Name", None)
-                if inst:
-                    candidates.append((inst, name or inst))
             try:
-                log_handler.log.info(f"WMI candidates count: {len(candidates)}")
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                log_handler.log.error(f"WMI query failed: {e}")
-            except Exception:
-                print(f"WMI query failed: {e}")
-            candidates = []
-
-        if not candidates:
-            return []
-
-        # runner для PowerShell: пробуем pwsh, иначе powershell
-        runner = shutil.which("pwsh") or "powershell"
-
-        def probe(instance_and_name):
-            inst, name = instance_and_name
-            try:
-                # вызываем только для одного InstanceId; возвращаем int battery или None
-                ps_cmd = f"(Get-PnpDeviceProperty -InstanceId '{inst}' -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data"
-                res = subprocess.run(
-                    [runner, "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True, text=True, encoding='cp866', timeout=8
-                )
-                out = (res.stdout or "").strip()
-                if not out:
-                    return None
-                m = re.search(r'\d+', out)
-                if not m:
-                    return None
-                return {"name": name, "id": inst, "id_type": "pnp", "battery": int(m.group(0))}
-            except subprocess.TimeoutExpired:
+                pythoncom.CoInitialize()
+                initialized_com = True
                 try:
-                    log_handler.log.debug(f"PS timeout for {inst}")
+                    log_handler.log.debug("pythoncom.CoInitialize() succeeded")
                 except Exception:
                     pass
-                return None
             except Exception as e:
                 try:
-                    log_handler.log.debug(f"PS error for {inst}: {e}")
+                    log_handler.log.warning(f"pythoncom.CoInitialize() failed or already initialized: {e}")
                 except Exception:
                     pass
-                return None
 
-        # параллельно опрашиваем кандидатов (ограничиваем worker-ы)
-        results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-            futs = [ex.submit(probe, c) for c in candidates]
-            for f in concurrent.futures.as_completed(futs):
+            # --- основной код метода (WMI + параллельный PowerShell) ---
+            try:
+                # подключаемся к WMI и получаем PNPDeviceID + Name только для кандидатов
+                locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+                svc = locator.ConnectServer(".", "root\\cimv2")
+                # фильтр по имени уменьшает количество проверяемых устройств
+                q = (
+                    "SELECT PNPDeviceID, Name FROM Win32_PnPEntity "
+                    "WHERE Status='OK' AND ("
+                    "Name LIKE '%Headphone%' OR Name LIKE '%Headphones%' OR "
+                    "Name LIKE '%Audio%' OR Name LIKE '%Hands-Free%' OR "
+                    "Name LIKE '%AirPods%' OR Name LIKE '%WH%' OR Name LIKE '%BT%'"
+                    ")"
+                )
+                items = svc.ExecQuery(q)
+                candidates = []
+                for it in items:
+                    inst = getattr(it, "PNPDeviceID", None)
+                    name = getattr(it, "Name", None)
+                    if inst:
+                        candidates.append((inst, name or inst))
                 try:
-                    r = f.result()
-                    if r:
-                        results.append(r)
+                    log_handler.log.info(f"WMI candidates count: {len(candidates)}")
                 except Exception:
                     pass
+            except Exception as e:
+                try:
+                    log_handler.log.error(f"WMI query failed: {e}")
+                except Exception:
+                    print(f"WMI query failed: {e}")
+                candidates = []
 
-        # убираем дубли по instance id
-        seen = set()
-        for r in results:
-            key = r.get("id")
-            if key and key not in seen:
-                seen.add(key)
-                devices.append(r)
+            if not candidates:
+                return []
 
-        try:
-            log_handler.log.info(f"DeviceManager (pywin32) found: {len(devices)}")
-        except Exception:
-            pass
+            # runner для PowerShell: пробуем pwsh, иначе powershell
+            runner = shutil.which("pwsh") or "powershell"
 
-        return devices
+            def probe(instance_and_name):
+                inst, name = instance_and_name
+                try:
+                    # вызываем только для одного InstanceId; возвращаем int battery или None
+                    ps_cmd = f"(Get-PnpDeviceProperty -InstanceId '{inst}' -KeyName 'DEVPKEY_Device_BatteryLevel' -ErrorAction SilentlyContinue).Data"
+                    res = subprocess.run(
+                        [runner, "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                        capture_output=True, text=True, encoding='cp866', timeout=8, creationflags=NO_WINDOW
+                    )
+                    out = (res.stdout or "").strip()
+                    if not out:
+                        return None
+                    m = re.search(r'\d+', out)
+                    if not m:
+                        return None
+                    return {"name": name, "id": inst, "id_type": "pnp", "battery": int(m.group(0))}
+                except subprocess.TimeoutExpired:
+                    try:
+                        log_handler.log.debug(f"PS timeout for {inst}")
+                    except Exception:
+                        pass
+                    return None
+                except Exception as e:
+                    try:
+                        log_handler.log.debug(f"PS error for {inst}: {e}")
+                    except Exception:
+                        pass
+                    return None
+
+            # параллельно опрашиваем кандидатов (ограничиваем worker-ы)
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+                futs = [ex.submit(probe, c) for c in candidates]
+                for f in concurrent.futures.as_completed(futs):
+                    try:
+                        r = f.result()
+                        if r:
+                            results.append(r)
+                    except Exception:
+                        pass
+
+            # убираем дубли по instance id
+            seen = set()
+            for r in results:
+                key = r.get("id")
+                if key and key not in seen:
+                    seen.add(key)
+                    devices.append(r)
+
+            try:
+                log_handler.log.info(f"DeviceManager (pywin32) found: {len(devices)}")
+            except Exception:
+                pass
+
+            return devices
+
+        finally:
+            # Обязательно разинициализируем COM в текущем потоке (если инициализировали)
+            if initialized_com:
+                try:
+                    pythoncom.CoUninitialize()
+                    try:
+                        log_handler.log.debug("pythoncom.CoUninitialize() called")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        log_handler.log.warning(f"pythoncom.CoUninitialize() failed: {e}")
+                    except Exception:
+                        pass
 
 class IconManager:
     def __init__(self, size: tuple = (64, 64)):
@@ -259,7 +299,6 @@ class TrayApplication:
         """Set menu and call update_menu under a lock to avoid concurrent UI races."""
         try:
             with self._menu_lock:
-                import time
                 now = time.time()
                 if now - self._last_menu_update_ts < self._minimal_menu_update_s:
                     # пропускаем слишком частые обновления меню
@@ -540,6 +579,7 @@ class TrayApplication:
             item('Отключиться от устройства', self.disconnect_device),
             item('Выход', self.exit_app)
         )
+
 log_handler = Logs()
 def main():
     app = TrayApplication()
