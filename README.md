@@ -12,9 +12,7 @@
 
 Требования
 - Windows 10
-- Python 3.8+ (проверено на 3.10).
 - Bluetooth‑адаптер включён и устройство подключено/видимо в Windows.
-- Устройство должно иметь значение DEVPKEY_Device_BatteryLevel в Windows (не все Bluetooth‑устройства это предоставляют).
 
 Зависимости
 - pystray
